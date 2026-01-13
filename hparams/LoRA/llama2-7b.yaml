@@ -1,0 +1,18 @@
+alg_name: "LoRA"
+model_name: "hugging_cache/llama2-7b"
+device: 0
+
+lora_type: "lora"
+layers: []
+num_steps: 20
+batch_size: 1
+max_length: 30
+lr: 5e-4
+weight_decay: 0
+kl_factor: 0
+rank: 8
+lora_alpha: 32
+lora_dropout: 0.1
+norm_constraint: false
+target_modules: ["down_proj"]  #["up_proj", "down_proj"] #["q_proj", "v_proj"]
+model_parallel: true
