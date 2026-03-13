@@ -119,7 +119,9 @@ def layer_stats(
                 maxlen = model.config.sliding_window or 4096
             else:
                 maxlen = 4096
-        
+        if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
+            maxlen = 4096
+
         if batch_tokens is not None and batch_tokens < maxlen:
             maxlen = batch_tokens
         return TokenizedDataset(raw_ds["train"], tokenizer, maxlen=maxlen)
@@ -142,7 +144,9 @@ def layer_stats(
             npos = model.config.sliding_window or 4096
         else:
             npos = 4096
-    
+    if hasattr(model.config, 'model_type') and 'qwen2' in model.config.model_type:
+            npos = 4096
+
     if batch_tokens is None:
         batch_tokens = npos * 3  # Sort and divide into batches with this many tokens
     if precision is None:
@@ -152,7 +156,8 @@ def layer_stats(
     if batch_tokens < npos:
         size_suffix = "_t{batch_tokens}" + size_suffix
     if model_name is None:
-        model_name = model.config._name_or_path.replace("/", "_")
+        # model_name = model.config._name_or_path.replace("/", "_")
+        model_name = model.config._name_or_path.rsplit("/")[-1]
 
     stats_dir = Path(stats_dir)
     file_extension = f"{model_name}/{ds_name}_stats/{layer_name}_{precision}_{'-'.join(sorted(to_collect))}{size_suffix}.npz"

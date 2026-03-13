@@ -120,11 +120,15 @@ def generate_fast(
         while input_ids.size(1) < max_out_len:  # while not exceeding max output length
             model_out = model(
                 input_ids=input_ids[:, cur_context],
-                attention_mask=None if 'llama'or'baichuan' in model.name_or_path.lower() else attention_mask[:, cur_context],
+                attention_mask=None if 'llama' in model.name_or_path.lower() or 'baichuan' in model.name_or_path.lower() or 'internlm' in model.name_or_path.lower() else attention_mask[:, cur_context],
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-            logits, past_key_values = model_out.logits, model_out.past_key_values
+            if type(model_out) is torch.Tensor:
+                logits = model_out
+            else:
+                logits = model_out.logits
+            past_key_values = model_out.past_key_values
             softmax_out = torch.nn.functional.softmax(logits[:, -1, :], dim=1)
 
             # Top-k sampling
@@ -169,3 +173,35 @@ def generate_fast(
     ]
 
     return txt
+
+def generate_standard(model, prompt, tokenizer, max_input_tokens=256, max_new_tokens=64, top_p=0.9, temperature=0.7, do_sample=False, top_k=50):
+
+    right_pad_flag=False
+    if tokenizer.padding_side == 'right':
+        tokenizer.padding_side = 'left'
+        right_pad_flag=True
+
+    inputs = tokenizer(prompt, padding = True, truncation = True, max_length = max_input_tokens, return_tensors = "pt").to('cuda')
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs, 
+            do_sample=do_sample,
+            max_new_tokens=max_new_tokens,
+            top_p=top_p,
+            top_k=top_k,
+            temperature=temperature,
+            pad_token_id=tokenizer.pad_token_id,
+            return_dict_in_generate=True,
+            output_scores=True
+        )
+
+    s = outputs.sequences
+    outputs = tokenizer.batch_decode(s, skip_special_tokens=True, \
+        clean_up_tokenization_spaces=True)
+    results = [output for output in outputs]
+
+    if right_pad_flag:
+        tokenizer.padding_side = 'right'
+
+    return results

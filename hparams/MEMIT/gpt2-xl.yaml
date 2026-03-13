@@ -20,6 +20,6 @@ attn_module_tmp: "transformer.h.{}.attn"
 ln_f_module: "transformer.ln_f"
 lm_head_module: "transformer.wte"
 mom2_dataset: "wikipedia"
-mom2_n_samples: 100
+mom2_n_samples: 100000
 mom2_dtype: "float32"
 model_parallel: false

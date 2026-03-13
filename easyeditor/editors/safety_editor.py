@@ -1,26 +1,20 @@
-import os.path
 from typing import Optional, Union, List, Tuple, Dict
 from time import time
-from torch.utils.data import Dataset
 from tqdm import tqdm
 import json
 import torch
-import logging
 import numpy as np
 import random
 from ..models.melo.melo import LORA
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 from transformers import LlamaTokenizer, LlamaForCausalLM
-from transformers import T5ForConditionalGeneration, T5Tokenizer
 from transformers import GPT2TokenizerFast, GPT2Tokenizer
-# from accelerate import Accelerator
 from ..util.globals import *
-from .singleton_editor import SingletonEditor
-from .batch_editor import BatchEditor
 from ..evaluate import compute_safety_edit_quality
 from ..util import nethook
 from ..util.hparams import HyperParams
 from ..util.alg_dict import *
+
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -79,20 +73,17 @@ class SafetyEditor:
             if 'llama' in self.model_name.lower():
                 self.model = LlamaForCausalLM.from_pretrained(self.model_name, output_hidden_states=True, torch_dtype=torch_dtype, device_map=device_map)
                 self.tok = LlamaTokenizer.from_pretrained(self.model_name)
-                self.tok.pad_token_id = self.tok.eos_token_id
+                self.tok.pad_token_id = self.tok.eos_token_id 
             elif 'mistral' in self.model_name.lower():
                 self.model = AutoModelForCausalLM.from_pretrained(self.model_name, output_hidden_states=True, torch_dtype=torch_dtype, device_map=device_map)
                 self.tok = AutoTokenizer.from_pretrained(self.model_name)
-                self.tok.pad_token_id = self.tok.eos_token_id
+                self.tok.pad_token_id = self.tok.eos_token_id 
+            elif 'gpt' in self.model_name.lower():
+                self.model = AutoModelForCausalLM.from_pretrained(self.model_name, output_hidden_states=True, torch_dtype=torch_dtype, device_map=device_map)
+                self.tok = GPT2Tokenizer.from_pretrained(self.model_name)
+                self.tok.pad_token_id = self.tok.eos_token_id    
             else:
                 raise NotImplementedError
-
-            if self.tok is not None and (isinstance(self.tok, GPT2Tokenizer) or isinstance(self.tok, GPT2TokenizerFast) or isinstance(self.tok, LlamaTokenizer)) and (hparams.alg_name not in ['ROME', 'MEMIT']):
-                LOG.info('AutoRegressive Model detected, set the padding side of Tokenizer to left...')
-                self.tok.padding_side = 'left'
-            if self.tok is not None and ('mistral' in self.model_name.lower()) and (hparams.alg_name in ['ROME', 'MEMIT']):
-                LOG.info('AutoRegressive Model detected, set the padding side of Tokenizer to right...')
-                self.tok.padding_side = 'right'
         else:
             self.model, self.tok = self.model_name
 
@@ -105,11 +96,14 @@ class SafetyEditor:
 
 
     def _locate_toxic_layer(self, model, tokenizer, requests, **kwargs):
+        # if isinstance(tokenizer, LlamaTokenizer):
+        #     tokenizer.padding_side = 'right'
+        # else:
+        #     tokenizer.padding_side = 'left'
         toxic_layer = []
         input = tokenizer([value for pair in requests for value in [pair["target_new"], pair["ground_truth"]]], return_tensors="pt", padding=True, truncation=True).to(f"cuda:{self.hparams.device}") 
         with torch.no_grad():
             outputs = model(**input)
-            # 获取每一层的隐藏状态
         hidden_states = outputs.hidden_states
         for j in range(len(requests)):
             max_distance_layer = None
@@ -125,6 +119,7 @@ class SafetyEditor:
         return toxic_layer
 
     def edit(self,
+             editing_method: Union[str],
              prompts: Union[str, List[str]],
              prompts_with_systemPrompt: Union[str, List[str]],
              target_new: Union[str, List[str]],
@@ -165,7 +160,8 @@ class SafetyEditor:
             requests = kwargs["requests"]
         else:
             requests = self._prepare_requests(prompts, target_new, ground_truth, general_prompt, locality_inputs, **kwargs)
-            requests_with_systemPrompt = self._prepare_requests(prompts_with_systemPrompt, target_new, ground_truth, general_prompt_with_systemPrompt, locality_inputs_with_systemPrompt, **kwargs)
+            if prompts_with_systemPrompt is not None:
+                requests_with_systemPrompt = self._prepare_requests(prompts_with_systemPrompt, target_new, ground_truth, general_prompt_with_systemPrompt, locality_inputs_with_systemPrompt, **kwargs)
 
         if hasattr(self.hparams, 'batch_size') :
                assert self.hparams.batch_size == 1, print(f'Single Edit, pls set the batch_size to 1....')
@@ -179,53 +175,85 @@ class SafetyEditor:
             for i, request in enumerate(tqdm(requests)):
                 metrics = {
                     "pre": compute_safety_edit_quality(self.model, self.tok, request,
-                                            self.hparams.device, max_output_tokens=600)
+                                            self.hparams.device, max_tokens=self.hparams.max_length, max_output_tokens=self.hparams.max_output_length)
                 }
                 all_metrics.append(metrics)
             if 'pre_file' in kwargs and kwargs['pre_file'] is not None:
                 ### Store the pre_edit metric to refrain computing repeatedly
                 json.dump(all_metrics, open(kwargs['pre_file'], 'w'), indent=4)
-        for i, (request, request_with_systemPrompt) in enumerate(zip(requests, requests_with_systemPrompt)):
-            start = time()
-            if len(self.hparams.layers) == 0:
-                self.hparams.layers = self._locate_toxic_layer(self.model, self.tok, [request,])
-            edited_model, weights_copy = self.apply_algo(
-                self.model,
-                self.tok,
-                [request_with_systemPrompt],
-                self.hparams,
-                copy=False,
-                return_orig_weights=True,
-                keep_original_weight=keep_original_weight,
-                train_ds=kwargs['train_ds'] if self.alg_name == 'IKE' else None
-            )
-            exec_time = time() - start
-            LOG.info(f"Execution {i} editing took {exec_time}")
-
-            start = time()
-            all_metrics[i].update({
-                'case_id': kwargs["case_id"],
-                "requested_rewrite": request,
-                "post": compute_safety_edit_quality(edited_model, self.tok, request_with_systemPrompt, self.hparams.device, max_output_tokens=self.hparams.max_output_length),
-                "time": exec_time,
-            })
-            
-            with torch.no_grad():
-                for k, v in weights_copy.items():
-                    nethook.get_parameter(self.model, k)[...] = v.to(f"cuda:{self.hparams.device}")
-            
-
-            LOG.info(f"Evaluation took {time() - start}")
-
-            if verbose:
-                LOG.info(
-                    f"{i} editing: {request['prompt']} -> {request['target_new']}  \n {all_metrics[i]}"
+        
+        if editing_method == "DINM":
+            for i, (request, request_with_systemPrompt) in enumerate(zip(requests, requests_with_systemPrompt)):
+                start = time()
+                if len(self.hparams.layers) == 0:
+                    self.hparams.layers = self._locate_toxic_layer(self.model, self.tok, [request,])
+                edited_model, weights_copy = self.apply_algo(
+                    self.model,
+                    self.tok,
+                    [request_with_systemPrompt],
+                    self.hparams,
+                    copy=False,
+                    return_orig_weights=True,
+                    keep_original_weight=keep_original_weight,
+                    train_ds=kwargs['train_ds'] if self.alg_name == 'IKE' else None
                 )
-        # case_result_path = base_case_path / f"case_{i}.json"
+                exec_time = time() - start
+                LOG.info(f"Execution {i} editing took {exec_time}")
 
-        # Dump metrics in .json
-        # with open(case_result_path, "w") as f:
-        #     json.dump(metrics, f, indent=1)
+                start = time()
+                all_metrics[i].update({
+                    'case_id': kwargs["case_id"],
+                    "requested_rewrite": request,
+                    "post": compute_safety_edit_quality(edited_model, self.tok, request_with_systemPrompt, self.hparams.device, max_tokens=self.hparams.max_length, max_output_tokens=self.hparams.max_output_length),
+                    "time": exec_time,
+                })
+                
+                with torch.no_grad():
+                    for k, v in weights_copy.items():
+                        nethook.get_parameter(self.model, k)[...] = v.to(f"cuda:{self.hparams.device}")
+                
+
+                LOG.info(f"Evaluation took {time() - start}")
+
+                if verbose:
+                    LOG.info(
+                        f"{i} editing: {request['prompt']} -> {request['target_new']}  \n {all_metrics[i]}"
+                    )
+        else:
+            for i, request in enumerate(requests):
+                start = time()
+                edited_model, weights_copy = self.apply_algo(
+                    self.model,
+                    self.tok,
+                    [request],
+                    self.hparams,
+                    copy=False,
+                    return_orig_weights=True,
+                    keep_original_weight=keep_original_weight,
+                    train_ds=kwargs['train_ds'] if self.alg_name == 'IKE' else None
+                )
+                exec_time = time() - start
+                LOG.info(f"Execution {i} editing took {exec_time}")
+
+                start = time()
+                all_metrics[i].update({
+                    'case_id': kwargs["case_id"],
+                    "requested_rewrite": request,
+                    "post": compute_safety_edit_quality(edited_model, self.tok, request, self.hparams.device, max_tokens=self.hparams.max_length, max_output_tokens=self.hparams.max_output_length),
+                    "time": exec_time,
+                })
+                
+                with torch.no_grad():
+                    for k, v in weights_copy.items():
+                        nethook.get_parameter(self.model, k)[...] = v.to(f"cuda:{self.hparams.device}")
+                
+
+                LOG.info(f"Evaluation took {time() - start}")
+
+                if verbose:
+                    LOG.info(
+                        f"{i} editing: {request['prompt']} -> {request['target_new']}  \n {all_metrics[i]}"
+                    )
 
         if isinstance(edited_model, LORA):
             edited_model=edited_model.model
@@ -240,16 +268,27 @@ class SafetyEditor:
                           locality_inputs: Optional[Dict] = None,
                           **kwargs
                           ):
+        if general_prompt is None:
+            requests = [{
+                'prompt': prompt,
+                'target_new': target_new_,
+                'ground_truth': ground_truth_,
+                'locality': {}
+            }
+            for prompt, ground_truth_, target_new_ in zip(prompts, ground_truth, target_new)
+            ]
+        
+        else:
 
-        requests = [{
-            'prompt': prompt,
-            'target_new': target_new_,
-            'ground_truth': ground_truth_,
-            'general_prompt': general_prompt_,
-            'locality': {}
-        }
-        for prompt, ground_truth_, target_new_, general_prompt_ in zip(prompts, ground_truth, target_new, general_prompt)
-        ]
+            requests = [{
+                'prompt': prompt,
+                'target_new': target_new_,
+                'ground_truth': ground_truth_,
+                'general_prompt': general_prompt_,
+                'locality': {}
+            }
+            for prompt, ground_truth_, target_new_, general_prompt_ in zip(prompts, ground_truth, target_new, general_prompt)
+            ]
 
         
         if locality_inputs is not None:

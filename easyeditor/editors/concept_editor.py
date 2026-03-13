@@ -202,7 +202,7 @@ class ConceptEditor:
                 edited_model = self.model
                 weights_copy = None
             else:
-                edited_model, weights_copy, upd_matrixs = self.apply_algo(
+                edited_model, weights_copy = self.apply_algo(
                     self.model,
                     self.tok,
                     [request],

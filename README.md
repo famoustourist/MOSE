@@ -11,7 +11,7 @@ The configuration files for MOSE are located in the `hparams/OFT` folder. Please
 ```
 from easyeditor import OFTHyperParams
 ## Loading config from hparams/OFT/gpt2-xl.yaml
-hparams = MENDHyperParams.from_hparams('./hparams/OFT/gpt2-xl')
+hparams = OFTHyperParams.from_hparams('./hparams/OFT/gpt2-xl')
 
 ## edit descriptor: prompt that you want to edit
 prompts = [

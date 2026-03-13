@@ -9,7 +9,13 @@ class BatchEditor(Enum):
     MEMIT = 'MEMIT'
     PMET = 'PMET'
     FT = 'FT'
+    QLoRA = 'QLoRA'
     LoRA = 'LoRA'
+    DPO = "DPO"
+    EMMET = "EMMET"
+    ALPHAEDIT = "AlphaEdit"
+    ULTRAEDIT = "ULTRAEDIT"
+    CORE = "CORE"
 
 
     @staticmethod
@@ -21,5 +27,11 @@ class BatchEditor(Enum):
             or alg_name == BatchEditor.MEMIT.value \
             or alg_name == BatchEditor.PMET.value \
             or alg_name == BatchEditor.FT.value \
-            or alg_name == BatchEditor.LoRA.value
+            or alg_name == BatchEditor.QLoRA.value \
+            or alg_name == BatchEditor.LoRA.value \
+            or alg_name == BatchEditor.DPO.value \
+            or alg_name == BatchEditor.ULTRAEDIT.value \
+            or alg_name == BatchEditor.EMMET.value \
+            or alg_name == BatchEditor.ALPHAEDIT.value \
+            or alg_name == BatchEditor.CORE.value
 

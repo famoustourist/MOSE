@@ -37,11 +37,8 @@ def apply_rome_to_model(
         model = deepcopy(model)
 
     weights_copy = {}
-    
 
-    deltas, left_vector, right_vector = execute_rome(model, tok, request, hparams)
-    
-    upd_matrixs={i:[] for i in list(deltas.keys())}
+    deltas = execute_rome(model, tok, request, hparams)
 
     with torch.no_grad():
         for w_name, (delta_u, delta_v) in deltas.items():
@@ -52,24 +49,11 @@ def apply_rome_to_model(
             if return_orig_weights and w_name not in weights_copy:
                 weights_copy[w_name] = w.detach().clone()
 
-            #w[...] += upd_matrix
-
-            rank = 0
-            #print("Rank of the matrix:", rank)
-            #print(w)
-
             w[...] += upd_matrix
-
-            upd_matrixs[w_name]=[w.cpu().numpy(),rank]
-
 
         print(f"New weights successfully inserted into {list(deltas.keys())}")
 
-    if not keep_original_weight:
-        weights_copy = {}
-    
-    return model, weights_copy, left_vector, right_vector
-    #return model, weights_copy, upd_matrixs
+    return model, weights_copy
 
 
 def execute_rome(
@@ -109,7 +93,7 @@ def execute_rome(
     }
     # Save old weights for future restoration
     weights_copy = {k: v.detach().clone() for k, v in weights.items()}
-
+    
     # Update loop: sequentially intervene at each specified layer
     deltas = {}
     for layer in sorted(hparams.layers):
@@ -154,8 +138,7 @@ def execute_rome(
 
     print(f"Deltas successfully computed for {list(weights.keys())}")
 
-    # return deltas
-    return deltas, left_vector.detach().cpu().numpy(), right_vector.detach().cpu().numpy()
+    return deltas
 
 
 def upd_matrix_match_shape(matrix: torch.Tensor, shape: torch.Size) -> torch.Tensor:

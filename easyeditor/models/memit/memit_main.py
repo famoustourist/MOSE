@@ -44,8 +44,6 @@ def apply_memit_to_model(
         model = deepcopy(model)
 
     deltas = execute_memit(model, tok, requests, hparams, cache_template=cache_template)
-    
-    upd_matrixs={i:[] for i in list(deltas.keys())}
 
     with torch.no_grad():
         for w_name, (key_mat, val_mat) in deltas.items():
@@ -58,18 +56,9 @@ def apply_memit_to_model(
                 weights_copy[w_name] = w.detach().clone()
             w[...] += upd_matrix.float()
 
-
-            rank = 0
-            upd_matrixs[w_name]=[w.cpu().numpy(),rank]
-
     print(f"New weights successfully inserted into {list(deltas.keys())}")
 
-    if not keep_original_weight:
-        weights_copy = {}
-    
-    
     return model, weights_copy
-    #return model, weights_copy, upd_matrixs
 
 
 def execute_memit(

@@ -30,6 +30,8 @@ class BaseTrainer:
     def __init__(self, config, train_set: Dataset, val_set: Dataset):
         LOG.info(f'Config: {config}')
         model_ = get_model(config)
+        if 'qwen2' in config.model_name.lower():
+            model_.bfloat16()
         self.alg_module = ALG_TRAIN_DICT[config.alg.upper()]
         LOG.info(f"Loading class {config.alg.upper()} from module {self.alg_module}")
         self.model = self.alg_module(model_, config, lambda: copy.deepcopy(model_))
@@ -52,6 +54,8 @@ class BaseTrainer:
         self.val_set = val_set
 
         if 'minigpt4' in self.config.model_name.lower() or 'blip2' in self.config.model_name.lower():
+            collate_fn = train_set.collate_fn
+        elif "llava-onevision" in self.config.model_name.lower() or "qwen2-vl" in self.config.model_name.lower():
             collate_fn = train_set.collate_fn
         elif 't5' in self.config.model_class.lower():
             collate_fn = train_set.collate_fn

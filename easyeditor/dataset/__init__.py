@@ -8,3 +8,9 @@ from .sanitization import SanitizationTrainDataset
 from .multitask import MultiTaskDataset
 from .personality import PersonalityDataset
 from .safety import SafetyDataset
+from .Cknowedit import CKnowEditDataset
+from .MQuAKE import MQuAKEDataset
+from .wikibigedit import WikiBigEditDataset
+from .ComprehendEdit import ComprehendEditDataset
+from .AKEW_both import AKEWUnifiedDataset
+from .LEME import LongFormEditDataset

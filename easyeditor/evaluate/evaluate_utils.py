@@ -8,7 +8,162 @@ import torch.nn.functional as F
 from ..trainer import *
 from sklearn.metrics import f1_score
 import openai
+from openai import OpenAI
+from transformers import T5ForConditionalGeneration
+import time
+import regex
+import string
 
+
+def normalize_answer(s):
+    def remove_articles(text):
+        return regex.sub(r'\b(a|an|the)\b', ' ', text)
+
+    def white_space_fix(text):
+        return ' '.join(text.split())
+
+    def remove_punc(text):
+        exclude = set(string.punctuation)
+        return ''.join(ch for ch in text if ch not in exclude)
+
+    def lower(text):
+        return text.lower()
+
+    return white_space_fix(remove_articles(remove_punc(lower(s))))
+
+def exact_match_score(prediction, ground_truth):
+    return normalize_answer(prediction) == normalize_answer(ground_truth)
+
+def llm_judge(question, ground_truth, prediction, api_key):
+    content_template = """
+Your job is to look at a question, a gold target, and a predicted answer, and then assign a grade of either ["CORRECT", "INCORRECT"].
+
+The following are examples of CORRECT predicted answers.
+```
+Question: What are the names of Barack Obama's children?
+Gold target: Malia Obama and Sasha Obama
+Predicted answer 1: sasha and malia obama
+Predicted answer 2: Malia and Sasha Obama are the names of Barack Obama's children.
+```
+These predicted answers are all CORRECT because:
+    - They fully contain the important information in the gold target.
+    - They do not contain any information that contradicts the gold target.
+
+The following are examples of INCORRECT predicted answers.
+```
+Question: What are the names of Barack Obama's children?
+Gold target: Malia and Sasha
+Predicted answer 1: Malia.
+Predicted answer 2: Malia, Sasha, and Susan.
+Predicted answer 3: Malia and Sasha, Malia and Sasha, Malia and Sasha, Malia and Sasha (repeated answer)
+```
+These predicted answers are all INCORRECT because:
+    - A factual statement in the answer contradicts the gold target or contain repeated answer.
+
+
+Here is a sample. Simply reply with either CORRECT or INCORRECT.
+
+```
+Question: {question}
+Gold target: {target}
+Predicted answer: {predicted_answer}
+```
+
+According to the gold target, please grade the predicted answer of this question as one of:
+A: CORRECT
+B: INCORRECT
+
+Just return the letters "A" or "B", with no text around it.
+    """.strip()
+
+    content = content_template.format(
+        question=question,
+        target=ground_truth,
+        predicted_answer=prediction,
+    )
+
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepseek.com"
+    )
+
+    completion = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": ""},
+            {"role": "user", "content": content}
+        ],
+        temperature=0.0
+    )
+    llm_ans = completion.choices[0].message.content
+    llm_score = 1.0 if llm_ans == "A" else 0.0
+    time.sleep(1) # avoid high rate of request
+    return llm_score
+
+def test_prediction_acc_LLM_judge(model, tok, hparams, prompts, targets, device, locality=False):
+    # generation & truncation
+    all_score = []
+    all_response = []
+    if isinstance(prompts, str):
+        prompts, targets = [prompts, ], [targets, ]
+    for prompt in prompts:
+        messages = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ]
+        text = tok.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        prompt_tok = tok(
+            text,
+            padding = True,
+            truncation = True,
+            return_tensors="pt",
+        ).to(f"cuda:{device}")
+        # add a template
+        gen_tokens = model.generate(
+            input_ids=prompt_tok['input_ids'],
+            attention_mask=prompt_tok['attention_mask'],
+            max_new_tokens=512,
+            stop_strings=[".", "\n", tok.eos_token],
+            tokenizer=tok,
+            pad_token_id=tok.eos_token_id,
+            do_sample=False,
+            use_cache=False,
+        )
+        # decode and process
+        if isinstance(model, T5ForConditionalGeneration):
+            trunc_gen_tokens = gen_tokens[0]  # encoder-decoder model only provied generated content after prompt
+        else:
+            trunc_gen_tokens = gen_tokens[0][prompt_tok['input_ids'].shape[1]:]  # decoder-only model provied generated content containing prompt
+        # if locality:
+        #     ans = trunc_gen_tokens.detach().cpu().numpy().tolist()
+        #     all_response.append(ans)
+        # else:
+        gen_content = tok.decode(trunc_gen_tokens)
+        suffixes_to_remove = [".", "\n", tok.eos_token]
+        for suffix in suffixes_to_remove:
+            if gen_content.endswith(suffix):
+                gen_content = gen_content[:-len(suffix)]
+        # LLM-as-a-Judge
+        if hparams.evaluation_type == "generate-text":
+            all_response.append(gen_content)
+        elif hparams.evaluation_type == "LLM-judge" and hasattr(hparams, 'api_key') and hparams.api_key:
+            LLM_Score = llm_judge(prompts, targets, gen_content, hparams.api_key)
+            all_score.append(LLM_Score)
+            all_response.append(gen_content)
+        else:
+            # the user do not provide api key, using exact match as an alternative
+            EM_Score = float(exact_match_score(gen_content, targets))
+            all_score.append(EM_Score)
+            all_response.append(gen_content)
+    
+    if len(all_score) > 0:
+        return all_score, all_response
+    else:
+        return all_response
 
 def test_batch_prediction_acc(model, tok, hparams, prompts, target, device, locality=False):
     prompt_tok = tok(
@@ -40,7 +195,6 @@ def test_batch_prediction_acc(model, tok, hparams, prompts, target, device, loca
             return ans
 
         return np.mean(np.equal(ans, target))
-
 
 def test_seq2seq_batch_prediction_acc(model, tok, hparams, prompts, targets, device, locality=False):
     if isinstance(prompts, str):
@@ -78,27 +232,25 @@ def test_seq2seq_batch_prediction_acc(model, tok, hparams, prompts, targets, dev
             return answers if type(answers[0]) is list else [answers,]
         return torch.mean((trg_tok['input_ids'][:,:-1] == ans[:,:-1]).float(), dim=-1).detach().cpu().numpy().tolist()
 
-
 def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=False, vanilla_generation=False):
     if vanilla_generation:
         if isinstance(prompts, str):
             prompts, targets = [prompts, ], [targets, ]
         results = []
         for prompt, target_new in zip(prompts, targets):
-            target_new_tokens = tok.encode(' ' + target_new)
-            if target_new_tokens[0] == tok.pad_token_id or (hasattr(tok, 'bos_token_id') and target_new_tokens[0] == tok.bos_token_id):
-                target_new_tokens = tok.encode(targets)
-                target_new_tokens = target_new_tokens[1:]
+            target_new_tokens = tok.encode(target_new, add_special_tokens=False)
             prompt_tok = tok(
                 prompt,
                 return_tensors="pt",
-            ).to(device)
+            ).to(f"cuda:{device}")
             gen_token = model.generate(
                 input_ids=prompt_tok['input_ids'],
                 attention_mask=prompt_tok['attention_mask'],
-                max_new_tokens=len(target_new_tokens)
+                max_new_tokens=len(target_new_tokens),
+                pad_token_id=tok.eos_token_id,
+                do_sample=False,
+                use_cache=False,
             )
-            
             if locality:
                 results.append(gen_token.detach().cpu().numpy().tolist()[0][-len(target_new_tokens):])
             else:
@@ -107,8 +259,15 @@ def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=
 
     if isinstance(prompts, str):
         prompts,targets = [prompts,], [targets,]
+    if not locality and hasattr(hparams, 'use_chat_template') and hparams.use_chat_template:
+        prompts = [[{"role":"user", "content":m}] for m in prompts]
+        prompts=tok.apply_chat_template(prompts,
+                                        add_generation_prompt=True,
+                                        tokenize=False)
     prompt_target = [prompt + ' ' + target for prompt, target in zip(prompts,targets)]
     max_prompt_len = max([len(tok.encode(_)) for _ in prompt_target]) + 1
+    before_padding_side = tok.padding_side
+    tok.padding_side = 'left'
     prompt_target_tok = tok(
         prompt_target,
         padding=True,
@@ -123,6 +282,7 @@ def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=
         max_length=max(hparams.max_length, max_prompt_len),
         return_tensors="pt",
     )
+    tok.padding_side = before_padding_side
     num_prompt_toks = [int((i != tok.pad_token_id).sum()) for i in prompt_tok['input_ids']]
     num_pad_toks = [int((i == tok.pad_token_id).sum()) for i in prompt_target_tok['input_ids'].cpu()]
     prompt_len = [x+y for x,y in zip(num_pad_toks,num_prompt_toks)]
@@ -136,10 +296,6 @@ def test_prediction_acc(model, tok, hparams, prompts, targets, device, locality=
         labels = prompt_target_tok['input_ids'].squeeze().detach().cpu().numpy().tolist()
         answers = slice_list(answers,prompt_len,left=True)
         labels = slice_list(labels,prompt_len,left=False)
-        
-        #print(answers, "\n\n", labels, "\n\n")
-        
-        
         if locality:
             return answers if type(answers[0]) is list else [answers,]
         if isinstance(answers[0], list):
@@ -191,9 +347,6 @@ def test_generation_quality(
     prefixes: typing.List[str],
     max_out_len: int,
     vanilla_generation: bool = False,
-    # consistency_texts: typing.List[str],
-    # essence_texts: typing.List[str],
-    # vec: TfidfVectorizer,
 ):
     gen_texts = generate_fast(
         model,
@@ -205,22 +358,10 @@ def test_generation_quality(
     )
 
     ngram_entropy = n_gram_entropy(gen_texts)
-    # consistency_tfidf = tfidf_similarity(
-    #     " ".join(gen_texts), " ".join(consistency_texts), vec
-    # )
-
     ret = {
         "ngram_entropy": ngram_entropy,
-        # "reference_score": consistency_tfidf,
-        # "text": gen_texts,
     }
-
-    # if len(essence_texts) > 0:
-    #     ppl = perplexity(model, tok, " ".join(essence_texts), max_input_length=100)
-    #     ret.update({"essence_score": ppl, "essence_text": essence_texts})
-
     return ret
-
 
 def n_gram_entropy(gen_texts, agg="arith"):
     assert agg in ["arith", "geom"]
@@ -228,7 +369,6 @@ def n_gram_entropy(gen_texts, agg="arith"):
     return (scipy.stats.mstats.gmean if agg == "geom" else np.mean)(
         [compute_n_gram_entropy(txt) for txt in gen_texts]
     ).item()
-
 
 def compute_n_gram_entropy(sentence, ns=None, weights=None, agg="arith"):
     if ns is None:
@@ -249,12 +389,10 @@ def compute_n_gram_entropy(sentence, ns=None, weights=None, agg="arith"):
 
     return (scipy.stats.mstats.gmean if agg == "geom" else np.mean)(entropy_list)
 
-
 def compute_freq(sentence, n=2):
     tokens = nltk.word_tokenize(sentence)
     ngrams = nltk.ngrams(tokens, n)
     return nltk.FreqDist(ngrams)
-
 
 def PPL(
     model,
@@ -286,6 +424,48 @@ def PPL(
     return ppl.cpu().numpy().tolist()
 
 
+def OOD_PPL(
+        model,
+        tok,
+        prompt: typing.Union[str, typing.List[str]],
+        target_new: typing.Union[str, typing.List[str]],
+        device,
+        threshold=0.8
+):
+    if isinstance(prompt, str):
+        prompt, target_new = [prompt, ], [target_new, ]
+
+    full_prompt = [f"{p}" for p, l in zip(prompt, target_new)]
+    tokens = tok(full_prompt, return_tensors="pt", padding=True, truncation=True)
+
+    tokens["labels"] = tokens['input_ids'].clone()
+    tokens["labels"][tokens["input_ids"] == tok.pad_token_id] = -100
+    batch = {f"{k1}": v1 for k1, v1 in tokens.items()}
+    input_ids = batch["input_ids"][:, :1024]  # .to(device)
+    target_ids = batch["labels"][:, :1024]
+
+    with torch.no_grad():
+        logits = model(input_ids=input_ids.to(device), labels=target_ids.to(device)).logits
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = target_ids.to(device)[:, 1:].contiguous()
+
+        log_probs = -nn.functional.log_softmax(shift_logits, dim=-1)
+        if shift_labels.dim() == log_probs.dim() - 1:
+            shift_labels = shift_labels.unsqueeze(-1)
+
+        padding_mask = shift_labels.eq(-100)
+
+        # In case the ignore_index is -100, the gather will fail, so we replace labels by 0. The padding_mask
+        # will ignore them in any case.
+        shift_labels = torch.clamp(shift_labels, min=0)
+
+        nll_loss = log_probs.gather(dim=-1, index=shift_labels)
+        nll_loss.masked_fill_(padding_mask, 0.0)
+
+        threshold = -np.log(threshold)
+
+        return len(nll_loss[nll_loss < threshold]) / len(nll_loss.view(-1))
+
 def verify_answer(model_answer, correct_answer):
     if type(correct_answer) is str:
         correct_answer = [[correct_answer]]
@@ -293,7 +473,6 @@ def verify_answer(model_answer, correct_answer):
         if True not in [possible_answer in model_answer for possible_answer in answer]:
             return False
     return True
-
 
 def answer_match(
     model,
@@ -307,7 +486,6 @@ def answer_match(
     predict = tok.decode(outputs[0], skip_special_tokens=True)
 
     return verify_answer(predict,target_new)
-
 
 def slice_list(matrix,start_indices,left):
     if isinstance(matrix[0], list):
@@ -327,18 +505,15 @@ def gather_log_probs(logits, labels):
     assert labels.shape == logits.shape[:-1]
     return logits.log_softmax(-1).gather(-1, labels.unsqueeze(-1)).squeeze(-1)
 
-
 def masked_mean(values, mask):
     assert mask.dtype == torch.bool
     assert values.shape == mask.shape
     return (values * mask.float()).sum() / mask.sum().float()
 
-
 def mask_hf_labels(labels, null_token=0):
     valid_mask = labels != -100
     valid_labels = labels.masked_fill(~valid_mask, null_token)
     return valid_mask, valid_labels
-
 
 def es(pre_logits, edit_logits, q_mask, labels, same_mask):
     
@@ -360,8 +535,6 @@ def es(pre_logits, edit_logits, q_mask, labels, same_mask):
 
     es_sent = z_sent * z_topic
     return es_sent
-        
-
 
 def es_per_icl(example, pre_logits, edit_logits):
     with torch.no_grad():
@@ -403,7 +576,6 @@ def es_per_icl(example, pre_logits, edit_logits):
             "wrong_probs": mean_neg_edit,
         }
 
-
 def per_generation(
     model,
     tok,
@@ -414,8 +586,6 @@ def per_generation(
     IKE=False,
     **kwargs
     ):
-    
-    
     def generate_text(query, model, tokenizer):
         input_text = query
         generation_config = {
@@ -455,7 +625,6 @@ def per_generation(
     }
 
     return result
-    
 
 def kl_loc_loss(pre, post, mask=None):
     
@@ -484,10 +653,7 @@ def kl_loc_loss(pre, post, mask=None):
 
 def F1(model, tok, hparams, prompts, targets, device, locality=False, vanilla_generation=True):
     if vanilla_generation:
-        target_new_tokens = tok.encode(' ' + targets)
-        if target_new_tokens[0] == tok.pad_token_id or (hasattr(tok, 'bos_token_id') and target_new_tokens[0] == tok.bos_token_id):
-            target_new_tokens = tok.encode(targets)
-            target_new_tokens = target_new_tokens[1:]
+        target_new_tokens = tok.encode(targets, add_special_tokens=False)
         prompt_tok = tok(
             prompts,
             return_tensors="pt",
@@ -495,7 +661,10 @@ def F1(model, tok, hparams, prompts, targets, device, locality=False, vanilla_ge
         gen_token = model.generate(
             input_ids=prompt_tok['input_ids'],
             attention_mask=prompt_tok['attention_mask'],
-            max_new_tokens=len(target_new_tokens)
+            max_new_tokens=len(target_new_tokens),
+            pad_token_id=tok.eos_token_id,
+            use_cache=False,
+
         )
         return f1_score(target_new_tokens, gen_token.detach().cpu().numpy().tolist()[0][-len(target_new_tokens):], average='macro')
     if isinstance(prompts, str):
@@ -531,8 +700,6 @@ def F1(model, tok, hparams, prompts, targets, device, locality=False, vanilla_ge
         labels = slice_list(labels,prompt_len,left=False)
 
         return f1_score(answers, labels, average='macro')
-
-
 
 def test_instance_change(model, tok, max_length, prompts, targets, device, P = None):
     demo1_str = "Whether FrancoAngeli belongs to category publisher? Yes\nWhether And Other Stories belongs to category people? No\n"
@@ -596,17 +763,38 @@ def test_concept_gen(model, tok, max_length, prompts, targets, device):
         model_response = [tok.decode(x, skip_special_tokens=True) for x in pre_edit_outputs.detach().cpu().numpy().tolist()]
         answer = model_response[0][len(prompts[0]):]
         return answer
-    
+
 
 def test_safety_gen(
         model, 
         tokenizer, 
         test_prompt, 
-        cuda, 
+        cuda,
+        max_tokens = 1624, 
         max_output_tokens=600):
-    input = tokenizer(test_prompt, return_tensors="pt", padding=True, truncation=True).to(f"cuda:{cuda}")
-    with torch.no_grad():
-        outputs = model.generate(**input, max_new_tokens=max_output_tokens)
-        texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
-        only_response = [out[len(test_prompt[index])+2:] for index, out in enumerate(texts)]
-    return only_response
+    tokenizer.padding_side = 'left'
+    # if input_tokens (at least 1024) + output_tokens (at least 600) < 1624, truncate the input length (from right to left, as harmful questions typically appear on the right)
+    if max_tokens < 1624:
+        only_response = []
+        for item in test_prompt:
+            input = tokenizer([item,], return_tensors="pt", padding=True, truncation=True).to(f"cuda:{cuda}")
+            if input["input_ids"].size(-1) > max_tokens-max_output_tokens:
+                input = {k: v[:, -(max_tokens - max_output_tokens):] for k, v in input.items()}
+            with torch.no_grad():
+                outputs = model.generate(**input, max_new_tokens=max_output_tokens)
+                texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
+                texts = texts[0]
+            if input["input_ids"].size(-1) > max_tokens-max_output_tokens:
+                max_overlap_len = min(len(item), len(texts))
+                overlap = next((item[-i:] for i in range(max_overlap_len, 0, -1) if item[-i:] == texts[:i]), "")
+            else:
+                overlap = item
+            only_response.append(texts[len(overlap)+1:].lstrip())
+        return only_response
+    else:
+        input = tokenizer(test_prompt, return_tensors="pt", padding=True, truncation=True).to(f"cuda:{cuda}")
+        with torch.no_grad():
+            outputs = model.generate(**input, max_new_tokens=max_output_tokens)
+            texts = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
+            only_response = [out[len(test_prompt[index])+1:] for index, out in enumerate(texts)]
+        return only_response
