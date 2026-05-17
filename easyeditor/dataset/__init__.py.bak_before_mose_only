@@ -1,0 +1,4 @@
+# Avoid importing multimodal datasets/processors at package import time.
+# MOSE text editing does not need coco_caption / LLaVA / video processors.
+
+from .counterfact import CounterFactDataset

@@ -1,0 +1,33 @@
+alg_name: "MOSE"
+model_name: "./hugging_cache/llama-3-8b-instruct"
+device: 0
+
+layers: [4, 5, 6, 7, 8]
+auto_layer_selection: false
+
+preserve_lambda: 1.0
+svd_reg: 0.0
+
+v_num_grad_steps: 25
+v_lr: 1e-1
+v_loss_layer: 31
+v_weight_decay: 0.5
+clamp_norm_factor: 0.75
+kl_factor: 0.0625
+
+rewrite_module_tmp: "model.layers.{}.mlp.down_proj"
+layer_module_tmp: "model.layers.{}"
+mlp_module_tmp: "model.layers.{}.mlp"
+attn_module_tmp: "model.layers.{}.self_attn"
+ln_f_module: "model.norm"
+lm_head_module: "lm_head"
+
+mom2_dataset: "wikipedia"
+mom2_n_samples: 100000
+mom2_dtype: "float32"
+mom2_update_weight: 15000
+stats_dir: "./data/stats"
+
+batch_size: 1
+max_length: 40
+model_parallel: false
